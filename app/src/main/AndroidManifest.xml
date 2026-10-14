@@ -1,0 +1,59 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.thexiaoxia43.coloros.theme">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="33" />
+
+    <!--
+        「我的」页里那张作者头像是运行时从酷安主页取的（见 CoolapkAvatar），
+        没有这条权限请求会直接抛 SecurityException，头像就只能一直是兜底图标。
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        模块设置页要读 LSPosed 管理器的版本号来显示「LSPosed 2.2.0 (7854)」。
+        Android 11+ 有包可见性过滤，不在这里声明的话 getPackageInfo 会直接抛
+        NameNotFoundException，主页那行就永远显示「未检测到」。
+    -->
+    <queries>
+        <package android:name="org.lsposed.manager" />
+    </queries>
+
+    <application
+        android:label="coloros全局主题"
+        android:allowBackup="false"
+        android:theme="@style/AppTheme">
+
+        <!-- Xposed/LSPosed 模块标记 -->
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="Hook and customize system UI elements" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposedmaxversion" android:value="100" />
+        <meta-data android:name="xposedscope" android:value="com.android.systemui" />
+        <!-- 让被 hook 的进程（SystemUI）能读取模块的 SharedPreferences -->
+        <meta-data android:name="xposedsharedprefs" android:value="true" />
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="coloros全局主题">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            控制中心长按面板「从相册选择底图」走的入口。
+            指向同一个 SettingsActivity，但套透明主题、不进最近任务：
+            选图期间用户只该看见相册，不该看见模块 App 的界面被拉到前台。
+            不能加 android:noHistory —— 打开相册时本页会 stop，noHistory 会把它
+            直接结束掉，onActivityResult 就再也收不到选图结果了。
+        -->
+        <activity-alias
+            android:name=".PickImageAlias"
+            android:targetActivity=".SettingsActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+    </application>
+</manifest>

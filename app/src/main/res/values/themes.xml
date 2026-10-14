@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 9 及以下没有 DayNight 主题，用固定的深色兜底。
+    Android 10+ 走 values-v29 里的同名主题，会自动跟随系统深色开关，
+    这样 AlertDialog 这类系统控件不用自己上色也能对。
+-->
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+</resources>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 10 起才有 Theme.DeviceDefault.DayNight。
+    弹确认框（AlertDialog）的底色、文字、按钮全靠这个主题跟随系统深色开关，
+    自己搭的界面部分走 UiTheme。
+-->
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>

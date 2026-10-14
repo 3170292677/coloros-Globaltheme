@@ -1,0 +1,28 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.thexiaoxia43.coloros.theme'
+    compileSdk 33
+    defaultConfig {
+        applicationId 'com.thexiaoxia43.coloros.theme'
+        minSdk 21
+        targetSdk 33
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    sourceSets {
+        main {
+            java {
+                exclude 'de/robv/android/xposed/**'
+            }
+        }
+    }
+}
+
+dependencies {
+    // 使用本地 Xposed API
+    compileOnly files('libs/xposed-api.jar')
+}
