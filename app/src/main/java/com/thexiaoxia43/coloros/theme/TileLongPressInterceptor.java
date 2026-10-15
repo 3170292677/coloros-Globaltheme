@@ -6,6 +6,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -133,6 +134,12 @@ public final class TileLongPressInterceptor {
 
     /** 用户实际长按的那块磁贴视图（见 {@link #hookPressedView}）。 */
     private static volatile WeakReference<View> sPressedView = new WeakReference<View>(null);
+
+    /** {@link #sPressedView} 记下的时刻（{@code uptimeMillis}），用来判断它是不是「这次按下」的。 */
+    private static volatile long sPressedAt;
+
+    /** {@link #sPressedView} 超过这么久就当过期：视图层没记到本次按压时不能拿旧的凑。 */
+    private static final long PRESS_FRESH_MS = 1200L;
 
     /** 已解析过形状的 spec，用于避免日志刷屏。 */
     private static final Map<String, String> sLoggedShape =
@@ -404,9 +411,13 @@ public final class TileLongPressInterceptor {
             }
         }
 
-        // 三阶段卡片：一张卡里三个图标，视图树里含 OplusQSThreeStageLayout
-        if (sThreeStageLayoutClass != null
-                && containsChildOfClass(tileView, sThreeStageLayoutClass)) {
+        // 三阶段卡片：一张卡里三个图标。标记可能出现在两处：
+        //  · 编辑面板预览 OplusQSResizeableThreeStageView 内含 OplusQSThreeStageLayout（子树）
+        //  · 主面板三阶段卡是 OplusQSTileViewImpl，三阶段布局 OplusQSThreeStageLayout 在它
+        //    <b>上层（祖先）</b>——findTileView 命中的是那块磁贴视图本身，只查子树会漏判，
+        //    落到尺寸判定被当成 2×1 宽卡片（表现为"长按三阶段被认成 2×1 / 上一次按的形状"）。
+        // 所以向上（祖先）和向下（子树）都扫 "ThreeStage" 字样，覆盖两种面板。
+        if (isThreeStageTile(tileView)) {
             return TileLongPressConfig.SHAPE_THREE;
         }
 
@@ -424,13 +435,17 @@ public final class TileLongPressInterceptor {
         }
         int cols = Math.round(w / (float) cell);
         int rows = Math.round(h / (float) cell);
+        String shape;
         if (cols >= 2 && rows >= 2) {
-            return TileLongPressConfig.SHAPE_2X2;
+            shape = TileLongPressConfig.SHAPE_2X2;
+        } else if (cols >= 2) {
+            shape = TileLongPressConfig.SHAPE_2X1;
+        } else {
+            shape = TileLongPressConfig.SHAPE_1X1;
         }
-        if (cols >= 2) {
-            return TileLongPressConfig.SHAPE_2X1;
-        }
-        return TileLongPressConfig.SHAPE_1X1;
+        XposedBridge.log(TAG + ": resolveShape " + cn + " w=" + w + " h=" + h
+                + " cell=" + cell + " cols=" + cols + " rows=" + rows + " -> " + shape);
+        return shape;
     }
 
     private static View backgroundView(View tileView) {
@@ -477,6 +492,69 @@ public final class TileLongPressInterceptor {
             for (int i = 0; i < g.getChildCount(); i++) {
                 if (containsChildOfClass(g.getChildAt(i), cls)) {
                     return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 这块磁贴视图是不是三阶段卡。
+     *
+     * <p>标记可能出现在两个方向：</p>
+     * <ul>
+     *   <li>向下（子树）：编辑面板预览 {@code OplusQSResizeableThreeStageView} 内含
+     *       {@code OplusQSThreeStageLayout}；主面板三阶段卡若以
+     *       {@code OplusQSThreeStageIconView} 当图标，也在子树里。</li>
+     *   <li>向上（祖先）：主面板三阶段卡是 {@code OplusQSTileViewImpl}，三阶段布局
+     *       {@code OplusQSThreeStageLayout} 在它<b>上层</b>，而 {@link #findTileView}
+     *       命中的是那块磁贴视图本身，只查子树会漏判，所以这里往祖先方向也扫一遍。</li>
+     * </ul>
+     */
+    private static boolean isThreeStageTile(final View tileView) {
+        if (tileView == null) {
+            return false;
+        }
+        if (containsChildOfClassNameContaining(tileView, "ThreeStage")) {
+            return true;
+        }
+        View cur = tileView;
+        for (int i = 0; i < 6 && cur != null; i++) {
+            if (cur.getClass().getName().contains("ThreeStage")) {
+                return true;
+            }
+            ViewParent parent = cur.getParent();
+            cur = parent instanceof View ? (View) parent : null;
+        }
+        return sThreeStageLayoutClass != null
+                && containsChildOfClass(tileView, sThreeStageLayoutClass);
+    }
+
+    /**
+     * 视图树里是否存在<b>类名包含</b>给定子串的视图（宽匹配）。
+     * 用于三阶段等按类名识别的形状——主面板三阶段卡的标记不一定是精确类
+     * {@code OplusQSThreeStageLayout}（那是编辑面板的），但它的布局 / 图标视图类名里
+     * 都带 "ThreeStage"，宽匹配即可覆盖。
+     */
+    private static boolean containsChildOfClassNameContaining(final View root, final String substr) {
+        if (root == null || substr == null || substr.isEmpty()) {
+            return false;
+        }
+        final java.util.Queue<View> queue = new java.util.ArrayDeque<View>();
+        queue.add(root);
+        while (!queue.isEmpty()) {
+            final View v = queue.poll();
+            if (v != null) {
+                final String cn = v.getClass().getName();
+                if (cn != null && cn.contains(substr)) {
+                    return true;
+                }
+                if (v instanceof ViewGroup) {
+                    final ViewGroup g = (ViewGroup) v;
+                    final int n = g.getChildCount();
+                    for (int i = 0; i < n; i++) {
+                        queue.add(g.getChildAt(i));
+                    }
                 }
             }
         }
@@ -551,7 +629,26 @@ public final class TileLongPressInterceptor {
         if (spec == null) {
             return null;
         }
-        return sSpecShape.get(spec);
+        String cached = sSpecShape.get(spec);
+        if (cached != null) {
+            return cached;
+        }
+        // sSpecShape 里可能没有这条 spec：本机主面板的磁贴类名带 "Resizeable"
+        // （OplusQSResizeableTileView*），被 isEditPanelView 当成编辑面板视图，
+        // cacheShape 就跳过了 spec→形状的写入（见那里的说明）。
+        // 这里退回该 spec 记着的视图现算一次，让底图刷新那条通道（updateBackground /
+        // refreshViewBackground）也能拿到形状——否则改了可见度 / 底图后刷新时会因为
+        // shape 为 null 直接放弃，表现为「调了没反应，非得重启系统界面才生效」。
+        View view = deref(sSpecView.get(spec));
+        if (view == null) {
+            return null;
+        }
+        String viewSpec = specFieldOf(view);
+        if (viewSpec.length() > 0 && !viewSpec.equals(spec)) {
+            // 视图被 RecyclerView 回收后重新 bind 成别的磁贴了，不能拿它算这条 spec 的形状
+            return null;
+        }
+        return shapeOfView(view);
     }
 
     /**
@@ -752,13 +849,8 @@ public final class TileLongPressInterceptor {
             return QuickEntranceButtonHook.refresh();
         }
         // 媒体播放卡片与认不出类名的卡片都不在 sSpecView 里（读不到 mTileSpec），
-        // 单独走一遍：它们的底图只能靠 applyStyleDirect 重新算一次套上去，
-        // refreshTileBackground 那套要 mBackgroundProxy 字段，这两类都没有。
-        // 形状按当初记下来的那个交回去，不现场判——媒体面板刷新时常常还没布局
+        // 单独记着，最后跟磁贴视图一起套样式
         List<View> extras = extraViewsOf(shape);
-        for (View extra : extras) {
-            TileBackgroundHook.applyStyleDirect(extra, shape);
-        }
 
         List<View> targets = new ArrayList<View>();
         synchronized (sSpecView) {
@@ -782,9 +874,33 @@ public final class TileLongPressInterceptor {
             }
         }
         targets.addAll(extras);
+        // 缓存的视图可能已经被 RecyclerView 回收换成别的实例（sSpecView 里那块早就
+        // 不在屏幕上了），所以再从根视图把控制中心里<b>现挂着</b>的磁贴扫一遍。
+        // 只扫，不去判：形状用 shapeOfView 现算，跟目标形状一致才算数。
+        for (View root : rootsOfCachedViews()) {
+            List<View> live = new ArrayList<View>();
+            collectLiveTiles(root, shape, live);
+            for (View view : live) {
+                if (!targets.contains(view)) {
+                    targets.add(view);
+                }
+            }
+        }
+        // 必须走 applyStyleDirect（形状已知，直接套上去），不能走 refreshTileBackground：
+        // 后者要重新从视图上读 mTileSpec，而本机主面板磁贴是 OplusQSResizeableTileView*
+        // 一族，压根没有这个字段 → spec 读到 null → shouldApplyTile 直接放弃刷新
+        // （实测一次刷新 20 块全是 "refresh skip(shouldApply=false) spec=null"）。
+        // 表现就是「改可见度 / 底图后不实时生效，非得重启系统界面」。
+        final boolean cardShape = TileLongPressConfig.SHAPE_CARD.equals(shape)
+                || TileLongPressConfig.SHAPE_CARD_WIDE.equals(shape);
         for (View view : targets) {
-            TileBackgroundHook.refreshTileBackground(view);
-            TileCornerHook.refreshView(view);
+            if (cardShape) {
+                // 卡片（1×1 方形 / 1×2）：卡片本体 + 内部所有铺着我们底图的层全部重设一遍。
+                // 可见的那层不一定被 cardVisibleLayer 记住，只赌一层就会出现「看着没变」。
+                TileBackgroundHook.applyStyleToCardLayers(view, shape);
+            } else {
+                TileBackgroundHook.applyStyleDirect(view, shape);
+            }
         }
         // 图标底色（2×1 图标下的小方块 / 三阶段跟着滑动的白块）是独立于磁贴底图的
         // 另一块色块，改完颜色得让它自己重刷一遍；其它形状内部会直接跳过
@@ -793,6 +909,61 @@ public final class TileLongPressInterceptor {
         TileColorHook.refresh(shape);
         XposedBridge.log(TAG + ": refreshed shape=" + shape + ", views=" + targets.size());
         return targets.size();
+    }
+
+    /** 缓存视图所在的那几个根视图（同一棵树只留一个）。 */
+    private static List<View> rootsOfCachedViews() {
+        List<View> roots = new ArrayList<View>();
+        synchronized (sSpecView) {
+            for (Map.Entry<String, WeakReference<View>> entry : sSpecView.entrySet()) {
+                WeakReference<View> ref = entry.getValue();
+                addRoot(roots, ref == null ? null : ref.get());
+            }
+        }
+        synchronized (sExtraViews) {
+            for (View view : sExtraViews.keySet()) {
+                addRoot(roots, view);
+            }
+        }
+        return roots;
+    }
+
+    private static void addRoot(final List<View> roots, final View view) {
+        if (view == null) {
+            return;
+        }
+        View root = view.getRootView();
+        if (root != null && !roots.contains(root)) {
+            roots.add(root);
+        }
+    }
+
+    /**
+     * 把这棵树里<b>现挂着</b>的磁贴按形状收进 {@code out}。
+     *
+     * <p>刷新时不能只信 {@link #sSpecView} 里缓存的视图——网格会回收视图，
+     * 缓存里那块可能早就不在屏幕上了，样式套上去看不见（用户反馈的「可见度不实时」）。
+     * 这里从根视图现扫，形状用 {@link #shapeOfView} 现算，跟目标形状一致才算数。</p>
+     *
+     * <p>只对「看着像磁贴 / 媒体面板 / 设备卡」的类名算形状，避免给整棵树每个 View 都算一遍。</p>
+     */
+    private static void collectLiveTiles(final View view, final String shape, final List<View> out) {
+        if (view == null || out.size() >= 60) {
+            return;
+        }
+        String cn = view.getClass().getName();
+        if (cn.contains("TileView") || cn.contains("MediaPanelView")
+                || cn.contains("DeviceCard") || cn.contains("EntranceCard")) {
+            if (shape.equals(shapeOfView(view))) {
+                out.add(view);
+            }
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                collectLiveTiles(group.getChildAt(i), shape, out);
+            }
+        }
     }
 
     // ------------------------------------------------------------ 长按拦截
@@ -821,6 +992,7 @@ public final class TileLongPressInterceptor {
                     View tile = findTileView(pressed);
                     if (tile != null) {
                         sPressedView = new WeakReference<View>(tile);
+                        sPressedAt = SystemClock.uptimeMillis();
                     }
                     blockAtViewLevel(pressed, param);
                 }
@@ -955,6 +1127,15 @@ public final class TileLongPressInterceptor {
             if (ctx == null) {
                 return false;
             }
+            // 排查用：把三阶段卡这次到底被算成什么形状的依据全打出来
+            // （anchor 类名 / spec / ThreeStage 是否命中 / spec 缓存兜底 / 兜底猜的形状）
+            XposedBridge.log(TAG + ": block diag anchorCls="
+                    + (anchor == null ? "null" : anchor.getClass().getName())
+                    + " spec=" + (anchor == null ? "?" : specFieldOf(anchor))
+                    + " threeStage=" + isThreeStageTile(anchor)
+                    + " sSpecShapeFallback=" + (anchor == null ? "?" : sSpecShape.get(specFieldOf(anchor)))
+                    + " guess=" + guessShape(anchor)
+                    + " → shape=" + shape);
             if (!TileLongPressConfig.isBlocked(ctx, shape)) {
                 logViewLevel(shape, anchor, "该形状没开拦截");
                 notifyNotBlocked("长按没拦到：" + TileLongPressConfig.label(shape)
@@ -1251,13 +1432,32 @@ public final class TileLongPressInterceptor {
             return null;
         }
         float min = cell * 0.7f;
+        // 上界：一块卡片最多跨 2 列 / 2 行（2×2 媒体面板不在这条兜底上，另有专门入口）。
+        // 不设上界的话，控制中心里那些铺满整块的覆盖层会被当成卡片——实测一个
+        // 963×963 的 com.oplus.charge.view.CircleView（充电动画）被认成
+        // 「1×1 方形卡片」，长按它就弹出一个张冠李戴的卡片面板
+        float max = cell * 2.6f;
         View current = pressed;
         for (int depth = 0; current != null && depth < 8; depth++) {
             String cn = current.getClass().getName();
             if (cn.contains("Notification") || isPanelContainer(current)) {
                 return null;
             }
-            if (current.getWidth() >= min && current.getHeight() >= min) {
+            int w = current.getWidth();
+            int h = current.getHeight();
+            if (w >= min && h >= min && w <= max && h <= max) {
+                // 只认类名里写着「卡片」的（SquareEntranceCardView / NoDeviceEntranceCardView
+                // / SquareDeviceCardView 这一族）。纯按尺寸认的话，网格里那些空位 / 磁贴外壳
+                // 尺寸也刚好一块磁贴大小，会被当成方形卡片——按在两块磁贴之间的空隙上，
+                // 就会弹出别人的面板（用户报的「按空隙弹其它磁贴的弹窗」）。
+                if (!cn.contains("Card")) {
+                    return null;
+                }
+                // 容器里已经装着磁贴的话，它是磁贴的外壳（实测 DeformationFrameLayout），
+                // 同样不是卡片
+                if (containsTileView(current)) {
+                    return null;
+                }
                 return current;
             }
             ViewParent parent = current.getParent();
@@ -1278,7 +1478,10 @@ public final class TileLongPressInterceptor {
         }
         View current = pressed;
         for (int depth = 0; current != null && depth < 10; depth++) {
-            if (isQsContainer(current) && !isPanelContainer(current)) {
+            // 装了磁贴的容器是磁贴外壳，不是网格里那张「认不出类名的卡片」：
+            // 按在两块磁贴之间的空隙上时不能拿它去推形状
+            if (isQsContainer(current) && !isPanelContainer(current)
+                    && !containsTileView(current)) {
                 int w = current.getWidth();
                 int h = current.getHeight();
                 if (w >= cell * 0.7f && h >= cell * 0.7f) {
@@ -1289,6 +1492,31 @@ public final class TileLongPressInterceptor {
             current = parent instanceof View ? (View) parent : null;
         }
         return null;
+    }
+
+    /**
+     * 这棵子树里有没有磁贴视图（带 {@code mTileSpec} 的那种）。
+     *
+     * <p>用来把「磁贴的外壳容器」跟「认不出类名的卡片」分开：外壳里装着磁贴，
+     * 卡片里没有。按在两块磁贴之间的空隙上时，按到的就是外壳那一层，
+     * 尺寸刚好一块磁贴大小，不区分的话会被当成方形卡片弹出别人的面板。</p>
+     */
+    private static boolean containsTileView(final View view) {
+        if (view == null) {
+            return false;
+        }
+        if (specFieldOf(view).length() > 0) {
+            return true;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                if (containsTileView(group.getChildAt(i))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -1357,20 +1585,54 @@ public final class TileLongPressInterceptor {
                 return;
             }
             String spec = (String) specObj;
-            // 优先级：实际被长按的那块视图 > spec 反查 > 最近布局过的视图。
-            // 必须是「被按的那块」——编辑/缩放面板里三种形状的预览共用同一个 spec，
-            // spec 反查只能随机指到其中一个，长按三阶段就会被判成别的形状而放行。
+            // 优先级：实际被长按的那块视图 > 该 spec 自己记着的视图 > spec 级形状缓存。
+            // 必须是「属于这次长按的那块」——编辑/缩放面板里三种形状的预览共用同一个 spec，
+            // 拿别的视图现算形状会把这块磁贴判成别的形状（面板开错形状）。
+            //
+            // 只认「刚刚按下」记下的那块视图。视图层没消费本次按压时（三阶段这类走
+            // QSTileImpl.longClick 的磁贴不会走到视图层），sPressedView 还停在上一张
+            // 磁贴上；而编辑面板的预览视图身上没有 mTileSpec，光靠 spec 核对拦不住它
+            // ——实测先按 1×1 再长按三阶段，形状被上一块 1×1 带偏成 1×1。
             View pressed = deref(sPressedView);
-            View anchor = isUsable(pressed) ? pressed : anchorFor(spec);
-            // 形状以这块磁贴视图现场判定的为准：sSpecShape 是 spec 级缓存，
-            // 拿它会把面板开到别的形状上（用户看着 1×1 磁贴，面板却在编辑三阶段）
-            String shape = anchor != null ? shapeOfView(anchor) : null;
+            if (!isUsable(pressed)
+                    || SystemClock.uptimeMillis() - sPressedAt > PRESS_FRESH_MS) {
+                pressed = null;
+            }
+            if (pressed != null) {
+                String pressedSpec = specFieldOf(pressed);
+                // 主面板磁贴带 mTileSpec，必须与本次 spec 一致；预览视图没有这个字段，
+                // 不因此否定它（它确实属于这次长按的那张卡）
+                if (pressedSpec.length() > 0 && !pressedSpec.equals(spec)) {
+                    pressed = null;
+                }
+            }
+            // 还是没拿到，就补该 spec 自己记着的视图（rememberAnchor 存的那块）：
+            // 网格视图会被 RecyclerView 回收后重新 bind，用前核对 mTileSpec 防串台
+            if (pressed == null) {
+                View specView = deref(sSpecView.get(spec));
+                if (isUsable(specView)) {
+                    String viewSpec = specFieldOf(specView);
+                    if (viewSpec.length() == 0 || viewSpec.equals(spec)) {
+                        pressed = specView;
+                    }
+                }
+            }
+            // 形状只信「确认属于本次 spec 的视图」；一块都没有才退回 spec 级缓存
+            // （cacheShape 在磁贴布局时按 spec 记下的形状）。绝不能像以前那样拿
+            // anchorFor() 的结果现算——那个兜底会落到 sLastAnchor，也就是上一张长按 /
+            // 布局过的磁贴，于是把它的形状安到这张卡头上：实测先按 2×1 再长按三阶段，
+            // 面板变成「2×1 宽卡片」；先按 1×1 又变成「1×1」。
+            String shape = isUsable(pressed) ? shapeOfView(pressed) : null;
             if (shape == null) {
                 shape = sSpecShape.get(spec);
             }
+            // 弹窗挂靠 / 位置可以用宽一点的兜底：形状已经定死，拿哪块视图当 anchor 都行
+            View anchor = isUsable(pressed) ? pressed : anchorFor(spec);
             Context ctx = (Context) XposedHelpers.getObjectField(tile, FIELD_CONTEXT);
             boolean blocked = shape != null && TileLongPressConfig.isBlocked(ctx, shape);
             XposedBridge.log(TAG + ": longClick spec=" + spec + " shape=" + shape
+                    + " (anchor=" + (anchor == null ? "null" : anchor.getClass().getSimpleName())
+                    + ", anchorSpec=" + (anchor == null ? "?" : specFieldOf(anchor)) + ")"
                     + " → " + (blocked ? "BLOCKED" : "pass"));
             if (!blocked) {
                 return;

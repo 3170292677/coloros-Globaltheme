@@ -457,9 +457,13 @@ public final class TileBackgroundHook {
                 // 换成了自定义底图：这个新实例也要带上状态，落点才反查得到
                 sDrawableActive.put(replacement, Boolean.valueOf(active));
             } else {
-                // 该形状只调了可见度：保留系统底图的形状与配色，仅改 alpha
-                applyAlphaOnly(original, context,
+                // 该形状只调了可见度：包住系统底图加一个持久可见度乘子
+                Drawable alphaProxy = applyAlphaOnly(original, context,
                         TileLongPressInterceptor.shapeOf(spec), active);
+                if (alphaProxy != null) {
+                    param.setResult(alphaProxy);
+                    sDrawableActive.put(alphaProxy, Boolean.valueOf(active));
+                }
             }
         } catch (Throwable t) {
             logOnce("replaceDrawableResult: " + t);
@@ -570,9 +574,17 @@ public final class TileBackgroundHook {
                 backgroundView.setBackground(replacement);
                 // 混色链路会先设遮罩再设底图，这里补一次清理，否则前景那层浅色会盖住底图
                 dropSystemMask(viewInfo);
+                logOnce("override bg applied spec=" + spec + " active=" + active
+                        + " shape=" + TileLongPressInterceptor.shapeOf(spec));
             } else {
-                applyAlphaOnly(backgroundView.getBackground(), context,
+                Drawable alphaProxy = applyAlphaOnly(backgroundView.getBackground(), context,
                         TileLongPressInterceptor.shapeOf(spec), active);
+                logOnce("override bg replacement=null spec=" + spec + " active=" + active
+                        + " shape=" + TileLongPressInterceptor.shapeOf(spec)
+                        + " alphaProxy=" + (alphaProxy != null));
+                if (alphaProxy != null) {
+                    backgroundView.setBackground(alphaProxy);
+                }
             }
         } catch (Throwable t) {
             logOnce("overrideBackgroundView: " + t);
@@ -974,6 +986,62 @@ public final class TileBackgroundHook {
     }
 
     /**
+     * 把卡片（1×1 方形 / 1×2）的样式重设一遍：<b>卡片本体 + 内部所有已经铺着我们底图的层</b>。
+     *
+     * <p>卡片的可见底不一定落在哪一层上（系统会在卡片内部那层 {@code ConstraintLayout} 上
+     * 铺模糊，也可能写回卡片自己），而刷新时没法保证每次都定位到可见的那层。
+     * 与其赌，不如把「已经是我们底图」的层全部重设一遍——可见的那层必在其中，
+     * 改可见度就不会出现「看着没变」。</p>
+     */
+    static void applyStyleToCardLayers(final View card, final String shape) {
+        if (card == null) {
+            return;
+        }
+        // 卡片本体也要来一遍：backgroundCarrier 认出来的承载层是卡片内部那层，
+        // 卡片自己身上往往还挂着上一版（pct=100）的底图，不重设的话它盖在下面，
+        // 内层改到 0 也看不出来（实测两层 pct 不一致就是这个原因）。
+        applyStyleToLayer(card, card, shape);
+        applyStyleDirect(card, shape);
+        refreshOwnedLayers(card, card, shape);
+    }
+
+    /** 递归把子树里背景已经是我们的 {@code TileBackgroundDrawable} 的层重设一遍。 */
+    private static void refreshOwnedLayers(final View root, final View view, final String shape) {
+        if (!(view instanceof ViewGroup)) {
+            return;
+        }
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child.getBackground() instanceof TileBackgroundDrawable) {
+                applyStyleToLayer(root, child, shape);
+            }
+            refreshOwnedLayers(root, child, shape);
+        }
+    }
+
+    /**
+     * 把某形状的样式直接套在卡片的<b>指定一层</b>上。
+     *
+     * <p>给 deviceplugin 卡片（1×1 方形 / 1×2）用：系统刚把底图设到哪一层，
+     * 我们就把样式落在哪一层——否则我们的底图会被系统那层盖住，
+     * 改可见度当场看不见（只有整块重建才生效）。</p>
+     */
+    static void applyStyleToLayer(final View card, final View layer, final String shape) {
+        if (card == null || layer == null) {
+            return;
+        }
+        applyStyleToTileView(card, null, shape, layer);
+        try {
+            Context ctx = card.getContext();
+            if (ctx != null && TileLongPressConfig.anyStyle(ctx)) {
+                TileCornerHook.refreshView(card);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
      * 底图样式的唯一落点逻辑。
      *
      * @param original 系统本次要设置的底图；从 {@code onLayout} 侧补样式时为 null
@@ -986,6 +1054,22 @@ public final class TileBackgroundHook {
 
     private static void applyStyleToTileView(final Object holder, final Drawable original,
             final String knownShape) {
+        applyStyleToTileView(holder, original, knownShape, null);
+    }
+
+    /**
+     * 同上，但可以<b>指定样式落在哪一层</b>。
+     *
+     * <p>给 1×1 方形卡片用：它的可见底是系统在卡片内部那层 {@code ConstraintLayout} 上的
+     * 模糊层（{@code BlurDrawable}），每次卡片刷新系统都会把那一层重设一遍，
+     * 而我们平时靠 {@link #backgroundCarrier} 启发式找承载层，未必就是系统刚设的那一层——
+     * 结果我们的底图贴到了别处、被系统那层盖住，改可见度当场看不见。
+     * 传了 {@code explicitBackground} 就直接落在那层上，跟系统的最后一次写对齐。</p>
+     *
+     * @param explicitBackground 指定的承载层；null 表示照旧用 getBackgroundView / 启发式
+     */
+    private static void applyStyleToTileView(final Object holder, final Drawable original,
+            final String knownShape, final View explicitBackground) {
         try {
             if (Boolean.TRUE.equals(sInjecting.get())) {
                 return;
@@ -1042,23 +1126,34 @@ public final class TileBackgroundHook {
 
             Object bgObj = callOrNull(tileView, "getBackgroundView");
             // 认不出类名的卡片（设备空间 / 耳机这类 deviceplugin 卡片）没有
-            // getBackgroundView()，可见底图挂在它内部铺满整卡的那一层上
-            View backgroundView = bgObj instanceof View
-                    ? (View) bgObj : backgroundCarrier(tileView);
+            // getBackgroundView()，可见底图挂在它内部铺满整卡的那一层上。
+            // 调用方指定了承载层（卡片刷新时系统刚写的那一层）就直接用它。
+            View backgroundView = explicitBackground != null ? explicitBackground
+                    : (bgObj instanceof View ? (View) bgObj : backgroundCarrier(tileView));
 
             Drawable base = original != null ? original : asDrawable(backgroundView.getBackground());
             Drawable styled = buildStyledBackground(context, style,
                     hasImage ? decodeShapeImage(base64) : null, active);
 
             if (styled == null) {
-                // 该形状只调了可见度：保留系统底图的形状与配色，仅改 alpha
-                applyAlphaOnly(base, context, shape, active);
+                // 该形状只调了可见度：包住系统底图加一个持久可见度乘子
+                Drawable alphaProxy = applyAlphaOnly(base, context, shape, active);
+                if (alphaProxy != null) {
+                    backgroundView.setBackground(alphaProxy);
+                    sDrawableActive.put(alphaProxy, Boolean.valueOf(active));
+                }
                 sLandingProbe = "spec=" + spec + " shape=" + shape + (active ? " 开" : " 关")
                         + " 已改可见度 " + (style != null ? style.alphaPct(active) : 100) + "%（无底图）";
                 return;
             }
             final String signature = styleSignature(shape, style, base64, active);
-            if (isSignatureApplied(backgroundView, signature)) {
+            // 设备卡片（1×1 方形 / 1×2）不做「已是最新」缓存：它们的可见底图挂在卡片内部
+            // 那层容器上，而 backgroundCarrier 是启发式认的，每次刷新拿到的承载层不一定
+            // 就是可见的那一层——被缓存判成「已是最新」的那层可能根本不是你看的那层，
+            // 于是改可见度当场看不见。这两类每次都重设一遍，代价可以忽略。
+            boolean cached = !TileLongPressConfig.SHAPE_CARD.equals(shape)
+                    && !TileLongPressConfig.SHAPE_CARD_WIDE.equals(shape);
+            if (cached && isSignatureApplied(backgroundView, signature)) {
                 // 同一次 updateBackground 被多个 hook 点重复命中，或参数没变
                 sLandingProbe = "spec=" + spec + " shape=" + shape + " 已是最新";
                 return;
@@ -1179,6 +1274,20 @@ public final class TileBackgroundHook {
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
     /**
+     * 卡片 → 系统最后一次给它设底图的那一层。
+     *
+     * <p>卡片的可见底图（模糊 / 主题色）是系统设在卡片内部某一层上的，那一层才是
+     * 用户看得见的底。刷新时没法再问系统「你上次设的是哪层」，这里记下来。</p>
+     */
+    private static final Map<View, View> sCardVisibleLayer =
+            Collections.synchronizedMap(new WeakHashMap<View, View>());
+
+    /** 卡片上「系统最后一次设底图」的那一层；没记到返回 null。 */
+    static View cardVisibleLayer(final View card) {
+        return card == null ? null : sCardVisibleLayer.get(card);
+    }
+
+    /**
      * deviceplugin 卡片（耳机 / 设备空间）的底图落点钩子。
      *
      * <p>这些卡片不是磁贴视图，{@code QsViewInfoProvider#updateBackground} 那条路
@@ -1234,6 +1343,11 @@ public final class TileBackgroundHook {
             final String shape = cardShape == null
                     ? TileLongPressConfig.SHAPE_CARD : cardShape;
             applyStyleDirect(card, shape);
+            // 系统刚把底（模糊 / 主题色）设到 view 这一层上，它才是可见的那层：
+            // 我们的样式也落在同一层，才不会被它盖回去（1×1 方形卡片的可见度实时化）。
+            // 顺手记住这层，刷新时也要落在它上面。
+            sCardVisibleLayer.put(card, view);
+            applyStyleToLayer(card, view, shape);
             // SDK 是在 onAttachedToWindow 里刷新卡片的，那时卡片还没布局、判不出形状，
             // 这里挂一次布局回调，等尺寸出来再补一遍（同一张卡片只挂一次）
             if (card.getWidth() > 0 && card.getHeight() > 0) {
@@ -1816,25 +1930,40 @@ public final class TileBackgroundHook {
     }
 
     /**
-     * 只调整可见度：直接改系统原底图的 alpha，形状与配色完全不动。
+     * 只调整可见度（无底图时）：包住系统原底图，给用户可见度加一个持久乘子，
+     * 形状与配色完全不动。
+     *
+     * <p>不能用 {@code drawable.setAlpha(...)} 直接改系统底图：系统每次淡入淡出 /
+     * 开关状态切换都会调 setAlpha 把它刷回满值，可见度就丢了。所以用 {@link AlphaProxyDrawable}
+     * 包一层，把系统 alpha 当动画 alpha、跟用户可见度相乘下发，用户值系统碰不到。</p>
+     *
+     * <p>返回要安装的代理 drawable；为 {@code null} 时表示无需改动（已是我们代理 /
+     * 该形状没调过可见度 / 有底图走另一条）。调用方负责把它设到背景上。</p>
      *
      * @param shape 已判出的形状；不按 spec 再反查一次，卡片这类读不到 spec 的视图
      *              （spec 为 null）否则会在这里静默返回
      */
-    private static void applyAlphaOnly(final Drawable drawable, final Context context,
+    private static Drawable applyAlphaOnly(final Drawable drawable, final Context context,
             final String shape, final boolean active) {
         if (drawable == null || shape == null) {
-            return;
+            return null;
         }
         String base64 = TileLongPressConfig.tileBgImage(context, shape, active);
         if (base64.length() > 0) {
-            return;
+            return null;
         }
         TileLongPressConfig.Style style = TileLongPressConfig.styleOf(context, shape);
         if (style == null || !style.touched) {
-            return;
+            return null;
         }
-        drawable.setAlpha(style.alphaPct(active) * 255 / 100);
+        if (drawable instanceof AlphaProxyDrawable) {
+            // 已经是我们的代理：直接更新用户可见度，别再包一层
+            ((AlphaProxyDrawable) drawable).setUserPct(style.alphaPct(active));
+            return null;
+        }
+        AlphaProxyDrawable proxy = new AlphaProxyDrawable(drawable);
+        proxy.setUserPct(style.alphaPct(active));
+        return proxy;
     }
 
     private static Drawable asDrawable(final Object result) {

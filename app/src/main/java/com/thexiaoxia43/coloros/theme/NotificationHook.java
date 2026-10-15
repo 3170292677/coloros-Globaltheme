@@ -4,6 +4,7 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.view.View;
 import android.view.ViewGroup;
@@ -13,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 
@@ -352,7 +354,14 @@ public final class NotificationHook {
                                             0f, 0f, 0f, 0f}
                                     : new float[]{radius, radius, radius, radius,
                                             radius, radius, radius, radius};
+                        } else if (isChildRowInGroup(view)) {
+                            // 子行是独立小卡：四角统一，跟普通卡一个口径。
+                            // 「跟随系统」时不能吃系统的逐角（子行内侧是直角），
+                            // 由 childRadiusPx 兜一个标量。
+                            float r = radius >= 0f ? radius : childRadiusPx(view);
+                            radii = new float[]{r, r, r, r, r, r, r, r};
                         } else if (isGroupRowSelf(view)) {
+                            // 分组头维持原样：展开时底角仍是内侧直角
                             radii = groupRadiiForRow(view, radius);
                         } else {
                             radii = new float[]{radius, radius, radius, radius,
@@ -418,36 +427,72 @@ public final class NotificationHook {
      * 时的高度，铺满会把下面没露出来的部分也糊上，那一态由分组头自己那一行负责。
      */
     private static void drawGroupBg(final View container, final Canvas canvas) {
-        Context ctx = container.getContext();
-        if (ctx == null || container.getWidth() <= 0 || container.getHeight() <= 0) {
+        if (container.getContext() == null
+                || container.getWidth() <= 0 || container.getHeight() <= 0) {
             return;
         }
         if (!containerExpanded(container)) {
             return;
         }
+        // 连体：整组一张底图铺到底（分组头那条薄块拉长覆盖最下面），中间缝是直的、
+        // 只有整组最外角圆 —— 跟原始 SystemUI 的分组卡一致。圆角统一用配置值（跟随
+        // 系统时取系统最大圆角），所以整组外角跟普通卡一致、且能随滑杆调节。
+        Drawable bg = buildTileDrawable(container);
+        if (bg == null) {
+            return;
+        }
+        bg.setBounds(0, 0, container.getWidth(), container.getHeight());
+        // 侧滑让出来的那块不能补底图（见 swipeHoles）：只挖那一块，别处照铺，
+        // 整组卡的观感不变。
+        int holes = clipHoles(canvas, swipeHoles(container, containerCandidates(container)));
+        try {
+            bg.draw(canvas);
+        } finally {
+            if (holes >= 0) {
+                canvas.restoreToCount(holes);
+            }
+        }
+        logOnce("group container bg drawn: " + container.getWidth()
+                + "x" + container.getHeight());
+    }
+
+    /**
+     * 跟通知卡片同一个口径的磨砂底图：同一张素材、同一个 {@code configuredRadiusPx}、同一个透明度。
+     * 用 {@link TileLongPressConfig#tileBgImage} + {@link TileBackgroundHook#decodeShapeImage}
+     * 解码素材，四角统一 {@code configuredRadiusPx}（跟随系统时取系统最大圆角）。
+     *
+     * <p>没配自定义底图时返回 {@code null}（留给系统原样）。返回的底图 bounds 已按
+     * {@code view} 当前尺寸设好；作为 {@code View#setBackground} 使用时视图会再按自身尺寸重设。</p>
+     */
+    static Drawable buildTileDrawable(final View view) {
+        Context ctx = view.getContext();
+        if (ctx == null) {
+            return null;
+        }
         String base64 = TileLongPressConfig.tileBgImage(
                 ctx, TileLongPressConfig.SHAPE_NOTIFICATION, true);
         if (base64.length() == 0) {
-            return;
+            return null;
         }
         Bitmap bitmap = TileBackgroundHook.decodeShapeImage(base64);
         if (bitmap == null) {
-            return;
+            return null;
         }
-        float radius = configuredRadiusPx(container);
+        float radius = configuredRadiusPx(view);
         if (radius < 0f) {
             radius = TileLongPressConfig.FOLLOW_SYSTEM_DP
                     * ctx.getResources().getDisplayMetrics().density;
         }
         float[] radii = new float[]{radius, radius, radius, radius,
                 radius, radius, radius, radius};
-        Drawable bg = new TileBackgroundDrawable(Color.TRANSPARENT, 0f, bitmap,
+        Drawable d = new TileBackgroundDrawable(Color.TRANSPARENT, 0f, bitmap,
                 alphaPctOf(ctx), 0, 0, 0f, false, radii);
-        bg.setBounds(0, 0, container.getWidth(), container.getHeight());
-        bg.draw(canvas);
-        logOnce("group container bg drawn: " + container.getWidth()
-                + "x" + container.getHeight() + " radius=" + (int) radius);
+        int w = view.getWidth();
+        int h = view.getHeight();
+        d.setBounds(0, 0, w > 0 ? w : 0, h > 0 ? h : 0);
+        return d;
     }
+
 
     /** 分组行的逐角圆角：交给 {@link #groupRadiiForRow}，按它在分组里的位置算。 */
     private static float[] groupRadii(final View view, final float radius) {
@@ -585,12 +630,12 @@ public final class NotificationHook {
         int kind = groupKind(view);
 
         float[] perCorner = null;
-        if (kind == KIND_HEADER) {
-            // 分组头这一行本身就是整卡：四角都在外缘
-            perCorner = new float[]{radius, radius, radius, radius,
-                    radius, radius, radius, radius};
-        } else if (kind == KIND_CHILD && radius >= 0f) {
-            // 子行按自己在分组里的位置算：外侧跟配置走、内侧一律直角
+        if (kind == KIND_CHILD) {
+            // 子卡是独立小卡：四角统一，跟普通卡一个口径，半径同样跟配置走。
+            // 分组头不动（见下面 KIND_HEADER 分支），用户只要求改下面三块。
+            float r = radius >= 0f ? radius : childRadiusPx(view);
+            perCorner = new float[]{r, r, r, r, r, r, r, r};
+        } else if (kind == KIND_HEADER) {
             perCorner = groupRadii(view, radius);
         } else if (radius < 0f) {
             if (systemRadii != null && !uniform(systemRadii)) {
@@ -606,6 +651,13 @@ public final class NotificationHook {
                         0, 0, 0f, false, perCorner)
                 : new TileBackgroundDrawable(Color.TRANSPARENT, radius, bitmap, alphaPct);
 
+        // 普通 / 堆叠卡（均匀圆角）：把系统底图裁切用的 mCornerRadii 强制成配置半径，
+        // 否则堆叠短卡会被系统的「半圆角」(0.5×maxRadius) 再裁一次，看着就是小折角。
+        // 分组连体卡走逐角（perCorner 非 null），交给系统自己的 mCornerRadii，不动。
+        if (perCorner == null && radius >= 0f) {
+            forceBgCornerRadii(view, radius);
+        }
+
         if (isAlphaTracked(view)) {
             target.setAlpha(intField(view, "mDrawableAlpha"));
         }
@@ -616,14 +668,30 @@ public final class NotificationHook {
         } catch (Throwable ignored) {
         }
 
+        // 侧滑露菜单时，行内容左移、卡片留在原地（系统的 mBackgroundNormal 特意不在
+        // mTranslateableViews 里，见 ExpandableNotificationRow#onFinishInflate），让出来
+        // 的那块本该露出控制中心背景 —— 不挖掉的话那儿会留一块卡片色，就是用户说的
+        // 「左滑那层白」。挖洞用窗口坐标换算，这样分组头那张铺满整组的卡也能只挖
+        // 被滑开的那一行那一条。
+        Rect[] holes = swipeHoles(view, swipeCandidates(view));
+
         if (kind == KIND_HEADER) {
             // 展开后分组头只占最上面一条，底图得按整组高度铺满，否则底下那些子行
             // 露出来的部分没有底图；收起时它就是一整张卡，走系统那条绘制路即可。
-            if (groupIsExpanded(view)) {
-                target.setBounds(0, 0, view.getWidth(), fullGroupHeight(view));
-                target.draw(canvas);
-            } else {
-                XposedHelpers.callMethod(view, "draw", canvas, target);
+            int cut = clipHoles(canvas, holes);
+            try {
+                if (groupIsExpanded(view)) {
+                    // 展开后分组头只占最上面一条，但底图按整组高度铺满：连体效果，
+                    // 最上面薄块拉长覆盖到最下面（跟原始 SystemUI 分组卡一致）。
+                    target.setBounds(0, 0, view.getWidth(), fullGroupHeight(view));
+                    target.draw(canvas);
+                } else {
+                    XposedHelpers.callMethod(view, "draw", canvas, target);
+                }
+            } finally {
+                if (cut >= 0) {
+                    canvas.restoreToCount(cut);
+                }
             }
             // 小球（应用图标）由 ext 画，跟系统那条路一样补一次
             if (ext != null) {
@@ -638,17 +706,24 @@ public final class NotificationHook {
 
         canvas.save();
         try {
-            boolean oplus = ext != null && Boolean.TRUE.equals(
-                    XposedHelpers.callMethod(ext, "getOplusStyle"));
-            if (oplus && drawWithExt(ext, canvas, target)) {
-                try {
-                    XposedHelpers.callMethod(ext, "calculateAndDrawIcon", view, canvas);
-                } catch (Throwable t) {
-                    logOnce("oplus icon draw failed - " + t);
+            int cut = clipHoles(canvas, holes);
+            try {
+                boolean oplus = ext != null && Boolean.TRUE.equals(
+                        XposedHelpers.callMethod(ext, "getOplusStyle"));
+                if (oplus && drawWithExt(ext, canvas, target)) {
+                    try {
+                        XposedHelpers.callMethod(ext, "calculateAndDrawIcon", view, canvas);
+                    } catch (Throwable t) {
+                        logOnce("oplus icon draw failed - " + t);
+                    }
+                } else {
+                    // 系统自己的绘制路径：算 bounds、画底图、点击效果、图标叠加都在里面
+                    XposedHelpers.callMethod(view, "draw", canvas, target);
                 }
-            } else {
-                // 系统自己的绘制路径：算 bounds、画底图、点击效果、图标叠加都在里面
-                XposedHelpers.callMethod(view, "draw", canvas, target);
+            } finally {
+                if (cut >= 0) {
+                    canvas.restoreToCount(cut);
+                }
             }
         } finally {
             canvas.restore();
@@ -666,6 +741,199 @@ public final class NotificationHook {
             logOnce("oplus draw failed, fall back to AOSP path - " + t);
             return false;
         }
+    }
+
+    // ------------------------------------------------------------ 侧滑让出区
+
+    /** 侧滑判定的最小位移（px）：比这小就当没滑（浮点余量不该让我们动刀）。 */
+    private static final float SWIPE_MIN_PX = 1f;
+
+    /**
+     * 这一行被侧滑推开了多少：往左滑（露出右边那两颗删除 / 设置）为负，往右滑为正，没滑是 0。
+     *
+     * <p>量的是<b>行内容</b>的位移，不是行本体：{@code ExpandableNotificationRow#setTranslation}
+     * 只推 {@code mTranslateableViews} 里的内容层（{@code onFinishInflate} 特意把
+     * {@code mBackgroundNormal} 摘了出去），行本体那个 {@code translationX} 是缩放 / 划走
+     * 动画用的，跟着它走会把没有侧滑的动画也当成侧滑。</p>
+     */
+    private static float swipeShift(final View row) {
+        if (row == null) {
+            return 0f;
+        }
+        try {
+            Object shift = XposedHelpers.callMethod(row, "getTranslation");
+            if (shift instanceof Float) {
+                return (Float) shift;
+            }
+        } catch (Throwable ignored) {
+            // 认不出的行（自定义卡片之类）：退回行本体的位移
+        }
+        return row.getTranslationX();
+    }
+
+    /**
+     * 画通知底图时，这一帧哪些行可能被侧滑推开了。
+     *
+     * <p>分组是一张连体卡：子行自己会滑，整组被滑时滑的是宿主分组头，而卡片（行自己的
+     * 底图、分组头那张铺满整组的底图）都盖着整个分组，所以整组的行都得算上。
+     * 普通通知不接管 —— 它侧滑本来什么样就什么样。</p>
+     */
+    private static List<View> swipeCandidates(final View bgView) {
+        View row = bgView.getParent() instanceof View ? (View) bgView.getParent() : null;
+        if (row == null || !isGroupRowSelf(row)) {
+            return null;
+        }
+        List<View> rows = new ArrayList<View>(6);
+        rows.add(row);
+        View summary = isChildRowInGroup(row) ? groupSummaryRow(row) : null;
+        if (summary != null && summary != row) {
+            rows.add(summary);
+            row = summary;
+        }
+        ViewGroup container = childrenContainer(row);
+        if (container != null) {
+            for (int i = 0; i < container.getChildCount(); i++) {
+                rows.add(container.getChildAt(i));
+            }
+        }
+        return rows;
+    }
+
+    /** 分组容器这张卡要看的行：它的每个子行，加上宿主分组头（整组被滑时滑的是它）。 */
+    private static List<View> containerCandidates(final View container) {
+        List<View> rows = new ArrayList<View>(6);
+        if (container instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) container;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                rows.add(group.getChildAt(i));
+            }
+        }
+        if (container.getParent() instanceof View) {
+            rows.add((View) container.getParent());
+        }
+        return rows;
+    }
+
+    /**
+     * 算出这一帧要挖掉的「侧滑让出区」，坐标已经换算到 {@code view} 自己的坐标系。
+     *
+     * <p>数值上 <b>左滑多少就挖右边多宽的一条</b>：侧滑时行内容整体左移，右边让出
+     * 一块给删除 / 设置，但卡片留在原地（见 {@link #swipeShift}），铺上去就是一块实色
+     * —— 用户反馈的「左滑那层白」。挖掉之后那儿就是控制中心背景。</p>
+     *
+     * <p><b>底边要停在「下面那一行」的顶边</b>：分组里相邻的行是互相压着的（下一行的
+     * 卡片顶边伸进上一行十几 px，所以整组看着是连体的，见实测 diag：挖洞 [1060,1291]
+     * 而下一行卡顶在 1276）。照行的矩形一路挖下去就会把那 15px 连同下一行卡片的顶角
+     * 圆角一起啃掉，看着就是缺一小块（用户反馈的「凹陷」）。所以底边取「下一行顶边」
+     * 与「本行底边」的较小值；整组被滑（滑的是宿主分组头、子行都在它里面）时不缩。</p>
+     *
+     * <p>位置统一按窗口坐标相减算，不假设行和 {@code view} 同一个原点：分组头那张卡
+     * 铺满整组（行在它下面好几层），行本身还可能被父级平移。</p>
+     */
+    private static Rect[] swipeHoles(final View view, final List<View> rows) {
+        if (rows == null) {
+            return null;
+        }
+        final int count = rows.size();
+        int[] xs = new int[count];
+        int[] ys = new int[count];
+        int[] hs = new int[count];
+        for (int i = 0; i < count; i++) {
+            View row = rows.get(i);
+            // 只看真在画面上的行：收起的组里子行还在（不可见），拿它们的坐标会误缩洞
+            int[] at = row != null && row.getVisibility() == View.VISIBLE
+                    ? windowOrigin(row) : null;
+            xs[i] = at == null ? Integer.MIN_VALUE : at[0];
+            ys[i] = at == null ? Integer.MIN_VALUE : at[1];
+            hs[i] = row != null ? row.getHeight() : 0;
+        }
+        int[] origin = null;
+        List<Rect> holes = null;
+        for (int i = 0; i < count; i++) {
+            View row = rows.get(i);
+            if (row == null || row.getWidth() <= 0 || row.getHeight() <= 0
+                    || xs[i] == Integer.MIN_VALUE) {
+                continue;
+            }
+            float shift = swipeShift(row);
+            if (Math.abs(shift) < SWIPE_MIN_PX) {
+                continue;
+            }
+            if (origin == null) {
+                origin = windowOrigin(view);
+                if (origin == null) {
+                    return null;
+                }
+            }
+            int left = xs[i] - origin[0];
+            int top = ys[i] - origin[1];
+            int right = left + row.getWidth();
+            int bottom = top + row.getHeight();
+            for (int k = 0; k < count; k++) {
+                // 下面那一行：顶边落在本行区间里、底边还伸到本行外面（压着本行的行）
+                if (ys[k] > ys[i] && ys[k] < ys[i] + row.getHeight()
+                        && ys[k] + hs[k] > ys[i] + row.getHeight()) {
+                    bottom = Math.min(bottom, ys[k] - origin[1]);
+                }
+            }
+            Rect hole = shift < 0f
+                    ? new Rect(Math.round(right + shift), top, right, bottom)
+                    : new Rect(left, top, Math.round(left + shift), bottom);
+            if (hole.isEmpty()) {
+                continue;
+            }
+            if (holes == null) {
+                holes = new ArrayList<Rect>(2);
+            }
+            holes.add(hole);
+        }
+        return holes == null ? null : holes.toArray(new Rect[0]);
+    }
+
+    /** 把 holes 从画布上挖掉。返回 {@code save()} 句柄；没动画布返回 -1（调用方不用还原）。 */
+    private static int clipHoles(final Canvas canvas, final Rect[] holes) {
+        if (holes == null || holes.length == 0) {
+            return -1;
+        }
+        int save = canvas.save();
+        for (int i = 0; i < holes.length; i++) {
+            canvas.clipOutRect(holes[i]);
+        }
+        return save;
+    }
+
+    /** 视图左上角在窗口里的坐标（含各级平移）；没挂在窗口上返回 null。 */
+    private static int[] windowOrigin(final View view) {
+        if (view == null || !view.isAttachedToWindow()) {
+            return null;
+        }
+        int[] location = new int[2];
+        view.getLocationInWindow(location);
+        return location;
+    }
+
+    /** 分组头挂着的分组子容器（Oplus 版继承自 AOSP 版，字段直接读）。 */
+    private static ViewGroup childrenContainer(final View summaryRow) {
+        try {
+            Object container = XposedHelpers.getObjectField(summaryRow, "mChildrenContainer");
+            return container instanceof ViewGroup ? (ViewGroup) container : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** 子行所在分组的宿主分组头：往上找第一个「带子容器的通知行」。 */
+    private static View groupSummaryRow(final View row) {
+        ViewParent parent = row.getParent();
+        for (int i = 0; i < 4 && parent instanceof View; i++) {
+            View candidate = (View) parent;
+            if (sRowClass != null && sRowClass.isInstance(candidate)
+                    && isGroupRowSelf(candidate)) {
+                return candidate;
+            }
+            parent = candidate.getParent();
+        }
+        return null;
     }
 
     // ------------------------------------------------------------ 分组逐角圆角
@@ -831,6 +1099,82 @@ public final class NotificationHook {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    /**
+     * 把通知底图视图（{@code NotificationBackgroundView}）上的 {@code mCornerRadii}
+     * 强制成统一半径 r，原地改写数组内容（数组引用是 final，但元素可变）。
+     *
+     * <p>系统画底图时用这个数组做圆角裁切，堆叠短卡的数组被系统压成「半圆角」
+     * (0.5×maxRadius)，于是我们画的大圆角底图又被它裁回小角——这就是堆叠卡看着像
+     * 「小折角」的根因。这里在画之前把它抬成配置半径，AOSP 的 {@code draw} 和 Oplus 的
+     * {@code ext.draw} 都读这同一个数组，一套搞定。</p>
+     */
+    private static void forceBgCornerRadii(final View bgView, float r) {
+        if (bgView == null) {
+            return;
+        }
+        try {
+            int h = bgView.getHeight();
+            if (h > 0 && r * 2f > h) {
+                r = h / 2f;
+            }
+            Object field = XposedHelpers.getObjectField(bgView, "mCornerRadii");
+            if (field instanceof float[] && ((float[]) field).length == 8) {
+                float[] arr = (float[]) field;
+                for (int i = 0; i < 8; i++) {
+                    arr[i] = r;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 拿不到就随系统
+        }
+    }
+
+    /**
+     * 分组子行该用的圆角：配了就跟普通卡一样用配置值；「跟随系统」时用系统给通知的
+     * 最大圆角（见 {@link #systemMaxRadius}）。
+     *
+     * <p>不能拿系统给子行的逐角数组：那组值内侧是直角（系统本来要把三行拼成一张
+     * 连体卡），照抄就永远是方的、也调不动。这里一律取<b>一个标量</b>，四角一致。</p>
+     */
+    private static float childRadiusPx(final View view) {
+        float radius = configuredRadiusPx(view);
+        return radius >= 0f ? radius : systemMaxRadius(view);
+    }
+
+    /**
+     * 系统给通知的最大圆角：{@code RoundableState#maxRadius}。
+     *
+     * <p>取证：{@code RoundableState} 有 {@code maxRadius} 字段，普通通知行的
+     * {@code topRoundness} 是 1，所以「普通卡的圆角」就等于这个值。</p>
+     *
+     * <p>字段在 {@code ExpandableOutlineView} 上，钩子拿到的可能是行本身也可能是
+     * 行里的底图视图，所以沿父级往上找两级。</p>
+     */
+    private static float systemMaxRadius(final View view) {
+        View current = view;
+        for (int depth = 0; current != null && depth < 4; depth++) {
+            try {
+                Object state = XposedHelpers.getObjectField(current, "mRoundableState");
+                if (state != null) {
+                    Object max = XposedHelpers.getObjectField(state, "maxRadius");
+                    if (max instanceof Float && (Float) max > 0f) {
+                        return (Float) max;
+                    }
+                }
+            } catch (Throwable ignored) {
+                // 这一层没这个字段：继续往上
+            }
+            ViewParent parent = current.getParent();
+            current = parent instanceof View ? (View) parent : null;
+        }
+        Context ctx = view.getContext();
+        if (ctx == null) {
+            return 0f;
+        }
+        return TileLongPressConfig.FOLLOW_SYSTEM_DP
+                * ctx.getResources().getDisplayMetrics().density;
     }
 
     private static boolean uniform(final float[] radii) {

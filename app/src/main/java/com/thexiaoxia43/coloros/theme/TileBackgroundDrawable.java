@@ -215,6 +215,7 @@ public class TileBackgroundDrawable extends Drawable {
             // 用 BitmapShader + drawPath 直接画，canvas.clipPath 在硬件加速下会被静默忽略
             final float bw = bitmap.getWidth();
             final float bh = bitmap.getHeight();
+            // 等比居中裁剪：保证铺满且不变形（磁贴/通知底图都用这个）。
             final float scale = Math.max(boundsRect.width() / bw, boundsRect.height() / bh);
             final float sw = bw * scale;
             final float sh = bh * scale;

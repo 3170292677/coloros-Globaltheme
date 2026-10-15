@@ -3,6 +3,7 @@ package com.thexiaoxia43.coloros.theme;
 import android.graphics.Canvas;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
 import android.view.View;
 
 import java.lang.ref.WeakReference;
@@ -52,6 +53,23 @@ public final class NotificationMenuHook {
 
     private static final String TAG = "SystemUIHook/NotificationMenu";
 
+    /**
+     * 侧滑菜单「删除 / 设置」图标那层底的落点所在类：
+     * 标准通知行与自定义卡片行两套实现，方法名与签名一致。
+     */
+    private static final String[] MENU_ROW_CLASSES = {
+            "com.oplus.systemui.notification.row.NotificationMenuRowExtImpl",
+            "com.oplus.systemui.statusbar.notification.customcard.OplusCustomMenuRow",
+    };
+
+    /** 侧滑菜单图标圆底的颜色：纯黑不透明。 */
+    private static final int MENU_ICON_DISC_COLOR = 0xFF000000;
+
+    /** 菜单行上挂着菜单项的字段：右边的项列表，外加删除 / 设置两项。 */
+    private static final String[] MENU_ITEM_FIELDS = {
+            "rightMenuItems", "deleteItem", "settingsItem",
+    };
+
     /** 造模糊代理的类，代理身上存着宿主 View。 */
     private static final String CLASS_VIEW_BLUR_PROXY =
             "com.oplusos.systemui.common.blurability.ViewBlurProxy";
@@ -99,6 +117,7 @@ public final class NotificationMenuHook {
     public static void install(final LoadPackageParam lpparam) {
         int n = hookBlurDrawable(lpparam);
         n += hookMaskDraw(lpparam);
+        n += hookMenuIconDisc(lpparam);
         XposedBridge.log(TAG + ": installed (hooks=" + n + ")");
     }
 
@@ -205,6 +224,109 @@ public final class NotificationMenuHook {
         }
     }
 
+    /**
+     * 侧滑露出的「删除 / 设置」图标：给它们铺一层<b>黑色圆底</b>。
+     *
+     * <p>系统本来靠 {@code NotificationMenuRowExtImpl#updateMenuBlurDrawable} 造一层
+     * 「模糊 + 浅色圆底」，这层在这台机器上压根画不出来（纯原生滑出来也是没有底的）。
+     * 所以不指望它，直接在 {@code setMenuViewBackground(MenuItem)} 之后把图标视图自己的
+     * 背景换成黑色椭圆——那层底就是这个图标视图的 background，图标（Lottie / 位图）
+     * 照旧画在上面。</p>
+     */
+    private static int hookMenuIconDisc(final LoadPackageParam lpparam) {
+        int hooked = 0;
+        for (String className : MENU_ROW_CLASSES) {
+            Class<?> cls = XposedHelpers.findClassIfExists(className, lpparam.classLoader);
+            if (cls == null) {
+                continue;
+            }
+            try {
+                XposedHelpers.findAndHookMethod(cls, "setMenuViewBackground",
+                        "com.android.systemui.plugins.statusbar.NotificationMenuRowPlugin$MenuItem",
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (param.args == null || param.args.length == 0) {
+                                        return;
+                                    }
+                                    Object view = XposedHelpers.callMethod(
+                                            param.args[0], "getMenuView");
+                                    applyBlackDisc(view instanceof View ? (View) view : null);
+                                } catch (Throwable t) {
+                                    logOnce("menu icon disc failed - " + t);
+                                }
+                            }
+                        });
+                hooked++;
+            } catch (Throwable t) {
+                logOnce("hook " + className + "#setMenuViewBackground - " + t);
+            }
+            // 侧滑过程中系统每次重造那层「模糊 + 底」（updateMenuBlurDrawable）都会把图标背景
+            // 重设一遍，我们刚铺的黑底会被它盖掉——它跑完再补一次，保证最后落在图标上的是黑底。
+            try {
+                XposedHelpers.findAndHookMethod(cls, "updateMenuBlurDrawable", String.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                applyDiscsToMenuItems(param.thisObject);
+                            }
+                        });
+                hooked++;
+            } catch (Throwable t) {
+                logOnce("hook " + className + "#updateMenuBlurDrawable - " + t);
+            }
+        }
+        return hooked;
+    }
+
+    /**
+     * 把黑底铺到该菜单行所有图标上。
+     *
+     * <p>图标视图从 {@code rightMenuItems} 列表（外加 deleteItem / settingsItem）里取，
+     * 每个元素都是 {@code NotificationMenuRowPlugin.MenuItem}，用它自己的
+     * {@code getMenuView()} 拿图标视图。</p>
+     */
+    private static void applyDiscsToMenuItems(final Object menuRowExt) {
+        for (String field : MENU_ITEM_FIELDS) {
+            Object value;
+            try {
+                value = XposedHelpers.getObjectField(menuRowExt, field);
+            } catch (Throwable ignored) {
+                continue;
+            }
+            if (value instanceof java.util.List) {
+                for (Object item : (java.util.List<?>) value) {
+                    applyDiscToItem(item);
+                }
+            } else {
+                applyDiscToItem(value);
+            }
+        }
+    }
+
+    private static void applyDiscToItem(final Object item) {
+        if (item == null) {
+            return;
+        }
+        try {
+            Object view = XposedHelpers.callMethod(item, "getMenuView");
+            applyBlackDisc(view instanceof View ? (View) view : null);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 给侧滑菜单的图标视图铺一个纯黑圆底。 */
+    private static void applyBlackDisc(final View view) {
+        if (view == null) {
+            return;
+        }
+        GradientDrawable disc = new GradientDrawable();
+        disc.setShape(GradientDrawable.OVAL);
+        disc.setColor(MENU_ICON_DISC_COLOR);
+        view.setBackground(disc);
+    }
+
     /** 这层壳包着的那张模糊图是谁造的 → 宿主 View。 */
     private static View hostOf(final Object maskDrawable) {
         Object inner = XposedHelpers.getObjectField(maskDrawable, FIELD_INNER_DRAWABLE);
@@ -224,4 +346,5 @@ public final class NotificationMenuHook {
         }
         XposedBridge.log(TAG + ": " + message);
     }
+
 }

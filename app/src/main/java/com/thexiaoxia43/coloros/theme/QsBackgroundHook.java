@@ -294,6 +294,15 @@ public final class QsBackgroundHook {
     /** 已经套到系统底板上的可见度与图片身份，用来判断设置有没有变。 */
     private static volatile int sScrimAppliedAlpha = -1;
     private static volatile String sScrimAppliedKey = "";
+    /**
+     * <b>每一层</b>上一次套上去的配置指纹。
+     *
+     * <p>必须按层记，不能只留一份全局的：整块面板上不止一层 scrim（底板 + 几块小尺寸 /
+     * 整屏蒙层），用全局指纹时第一层套完就把全局刷成了新指纹，后面几层——包括真正可见
+     * 的底板那层——会被判成「设置没变」而只调可见度，<b>颜色还是旧的</b>。
+     * 表现就是改色后画面弹回上一个颜色（用户反馈的「控制中心背景调色会回弹」）。</p>
+     */
+    private static final Map<View, String> sScrimKeys = new WeakHashMap<View, String>();
     /** {@code ScrimView#setDrawable(Drawable)}，用来精确传 null（XposedHelpers 传 null 会解析不出方法）。 */
     private static volatile Method sSetDrawableMethod;
     private static volatile Method sGetDrawableMethod;
@@ -927,10 +936,32 @@ public final class QsBackgroundHook {
         }
         int alpha = 100 - TileLongPressConfig.bgTransparencyPct(context);
         String key = settingKey(context);
-        if (alpha == sScrimAppliedAlpha && key.equals(sScrimAppliedKey)) {
+        if (alpha == sScrimAppliedAlpha && key.equals(sScrimAppliedKey)
+                && scrimsUpToDate(views, key)) {
             return;
         }
         applyToAll();
+    }
+
+    /**
+     * 每一块整屏蒙层是不是都已经套上这份配置。
+     *
+     * <p>只看全局那份指纹不够：它记的是「最后一次套上去的」，某一层漏套了照样会显示
+     * 「已经是最新」。看门狗靠这个判断要不要整轮重套，按层看才能把漏掉的那层补回来。</p>
+     */
+    private static boolean scrimsUpToDate(final List<View> views, final String key) {
+        boolean any = false;
+        for (int i = 0; i < views.size(); i++) {
+            View view = views.get(i);
+            if (!isFullScreenScrim(view)) {
+                continue;
+            }
+            any = true;
+            if (!key.equals(sScrimKeys.get(view))) {
+                return false;
+            }
+        }
+        return any;
     }
 
     /** 背景图的身份串，用来判断设置有没有变。 */
@@ -957,15 +988,20 @@ public final class QsBackgroundHook {
     }
 
     /**
-     * 背景设置的身份串（颜色 + 底图），用来判断设置有没有变。
+     * 背景设置的身份串（颜色 + 底图 + 模糊开关），用来判断设置有没有变。
      *
      * <p>必须把颜色也算进来：只改颜色时底图那句 base64 是不变的，
      * 光比图片会让「改了颜色」被判成「没变」，于是画面上什么都不动。</p>
+     *
+     * <p>底图只用「长度 + 哈希」参与：它是一整串 base64（可能上兆），而这个串会按层
+     * 留在 {@link #sScrimKeys} 里，留全量等于把内存顶上去。</p>
      */
     private static String settingKey(final Context context) {
         // 模糊开关也得算进来：它决定背景层是「系统模糊图 + 我们的图」还是只有我们的图，
         // 少了这一段，拨开关时会被判成「设置没变」而什么都不做
-        return Integer.toHexString(bgColor(context)) + "|" + imageKey(context)
+        String image = imageKey(context);
+        return Integer.toHexString(bgColor(context)) + "|" + image.length() + ":"
+                + Integer.toHexString(image.hashCode())
                 + (TileLongPressConfig.isBgBlurOff(context) ? "|blurOff" : "|blurOn");
     }
 
@@ -1295,6 +1331,7 @@ public final class QsBackgroundHook {
             }
             sScrimAppliedAlpha = alpha;
             sScrimAppliedKey = key;
+            sScrimKeys.put(view, key);
             sLastApply = "可见度 " + alpha + "%（不画背景）";
             return;
         }
@@ -1303,8 +1340,10 @@ public final class QsBackgroundHook {
         TileBackgroundDrawable existing = sScrimDrawables.get(view);
         // 还得确认画我们那张图的链路<还在>：系统时不时会自己再 setDrawable 一次
         // （refreshBehindDrawable 看到当前不是 AutoBlurDrawable 就重放一张），
-        // 这时候只调 alpha 是白调——画面上的图已经换成系统的了，要重新铺上去
-        if (existing != null && key.equals(sScrimAppliedKey)
+        // 这时候只调 alpha 是白调——画面上的图已经换成系统的了，要重新铺上去。
+        // 比的是<b>这一层</b>记的指纹（见 sScrimKeys）：用全局那份会把后面几层
+        // 误判成「没变」，颜色就换不上去
+        if (existing != null && key.equals(sScrimKeys.get(view))
                 && (keepBlur ? isBlurDrawable(current) : containsOurDrawable(current))) {
             existing.setUserAlphaPct(alpha);
             view.invalidate();
@@ -1332,6 +1371,7 @@ public final class QsBackgroundHook {
         sCurrentAlpha = Math.round(alpha * 255f / 100f);
         sScrimAppliedAlpha = alpha;
         sScrimAppliedKey = key;
+        sScrimKeys.put(view, key);
         // 接管成功后把自己以前糊在根视图上的那层擦掉，免得两层叠着
         dropRootBackgrounds();
         if (keepBlur) {
@@ -1370,6 +1410,7 @@ public final class QsBackgroundHook {
             setScrimDrawable(view, original);
         }
         sScrimDrawables.remove(view);
+        sScrimKeys.remove(view);
         sBaseAlphaPct = 100;
         Context context = view.getContext();
         sScrimAppliedAlpha = context == null
