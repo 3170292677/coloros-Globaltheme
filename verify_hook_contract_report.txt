@@ -1,10 +1,10 @@
-SystemUI dex dir : C:\Users\Administrator\Desktop\新建文件夹 (2)\系统界面_16.00.12_unpacked
-hook source      : C:\Users\Administrator\Desktop\新建文件夹 (2)\system-ui-hook\app\src\main\java\com\thexiaoxia43\coloros\theme\TileBackgroundHook.java
+SystemUI dex dir : c:\Users\Administrator\Desktop\新建文件夹 (2)\系统界面_16.00.12_unpacked
+hook source      : c:\Users\Administrator\Desktop\新建文件夹 (2)\system-ui-hook\app\src\main\java\com\thexiaoxia43\coloros\theme\TileBackgroundHook.java
 SystemUI classes : 65498
 SystemUI refs    : 14985 oplus types
 hook classes     : 4 drawable / 3 color
 hook methods     : obtainDrawableForActive, obtainDrawableForInactive, obtainDrawableForUnavailable, refreshViewBackground, onBackgroundAttach
 ----------------------------------------------------------------------------------------------------
-APK oplus refs   : 62
+APK oplus refs   : 64
 ----------------------------------------------------------------------------------------------------
-PASSED  107/107 checks
+PASSED  109/109 checks
